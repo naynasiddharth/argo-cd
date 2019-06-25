@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -149,9 +150,14 @@ func NewApplicationCreateCommand(clientOpts *argocdclient.ClientOptions) *cobra.
 			fmt.Printf("application '%s' created\n", created.ObjectMeta.Name)
 		},
 	}
-	command.Flags().StringVarP(&fileURL, "file", "f", "", "Filename or URL to Kubernetes manifests for the app")
 	command.Flags().StringVar(&appName, "name", "", "A name for the app, ignored if a file is set (DEPRECATED)")
 	command.Flags().BoolVar(&upsert, "upsert", false, "Allows to override application with the same name even if supplied application spec is different from existing spec")
+	command.Flags().StringVarP(&fileURL, "file", "f", "", "Filename or URL to Kubernetes manifests for the app")
+	// Only complete files with appropriate extension.
+	err := command.Flags().SetAnnotation("file", cobra.BashCompFilenameExt, []string{"json", "yaml", "yml"})
+	if err != nil {
+		log.Fatal(err)
+	}
 	addAppFlags(command, &appOpts)
 	return command
 }
@@ -411,6 +417,8 @@ func setAppOptions(flags *pflag.FlagSet, app *argoappv1.Application, appOpts *ap
 			app.Spec.Project = appOpts.project
 		case "nameprefix":
 			setKustomizeOpt(&app.Spec.Source, &appOpts.namePrefix)
+		case "jsonnet-tlas":
+			setJsonnetOpt(&app.Spec.Source, appOpts.jsonnetTlaParameters)
 		case "sync-policy":
 			switch appOpts.syncPolicy {
 			case "automated":
@@ -473,6 +481,33 @@ func setHelmOpt(src *argoappv1.ApplicationSource, valueFiles []string, releaseNa
 	}
 }
 
+func setJsonnetOpt(src *argoappv1.ApplicationSource, tlaParameters []string) {
+	if src.Directory == nil {
+		src.Directory = &argoappv1.ApplicationSourceDirectory{}
+	}
+
+	if len(tlaParameters) != 0 {
+		tlas := make([]argoappv1.JsonnetVar, len(tlaParameters))
+		for index, paramStr := range tlaParameters {
+			parts := strings.SplitN(paramStr, "=", 2)
+			if len(parts) != 2 {
+				log.Fatalf("Expected parameter of the form: param=value. Received: %s", paramStr)
+				break
+			}
+			tlas[index] = argoappv1.JsonnetVar{
+				Name:  parts[0],
+				Value: parts[1],
+				Code:  true}
+		}
+		src.Directory.Jsonnet.TLAs = tlas
+	}
+
+	if src.Directory.IsZero() {
+		src.Directory = nil
+	}
+
+}
+
 type appOptions struct {
 	repoURL                string
 	appPath                string
@@ -489,6 +524,7 @@ type appOptions struct {
 	namePrefix             string
 	directoryRecurse       bool
 	configManagementPlugin string
+	jsonnetTlaParameters   []string
 }
 
 func addAppFlags(command *cobra.Command, opts *appOptions) {
@@ -507,6 +543,7 @@ func addAppFlags(command *cobra.Command, opts *appOptions) {
 	command.Flags().StringVar(&opts.namePrefix, "nameprefix", "", "Kustomize nameprefix")
 	command.Flags().BoolVar(&opts.directoryRecurse, "directory-recurse", false, "Recurse directory")
 	command.Flags().StringVar(&opts.configManagementPlugin, "config-management-plugin", "", "Config management plugin name")
+	command.Flags().StringArrayVar(&opts.jsonnetTlaParameters, "jsonnet-tlas", []string{}, "Jsonnet top level arguments")
 }
 
 // NewApplicationUnsetCommand returns a new instance of an `argocd app unset` command
@@ -612,21 +649,27 @@ func liveObjects(resources []*argoappv1.ResourceDiff) ([]*unstructured.Unstructu
 }
 
 func getLocalObjects(app *argoappv1.Application, local string, appLabelKey string) []*unstructured.Unstructured {
-	res, err := repository.GenerateManifests(local, &repository.ManifestRequest{
+	manifestStrings := getLocalObjectsString(app, local, appLabelKey)
+	objs := make([]*unstructured.Unstructured, len(manifestStrings))
+	for i := range manifestStrings {
+		obj := unstructured.Unstructured{}
+		err := json.Unmarshal([]byte(manifestStrings[i]), &obj)
+		errors.CheckError(err)
+		objs[i] = &obj
+	}
+	return objs
+}
+
+func getLocalObjectsString(app *argoappv1.Application, local string, appLabelKey string) []string {
+	res, err := repository.GenerateManifests(filepath.Dir(local), filepath.Base(local), &repository.ManifestRequest{
 		ApplicationSource: &app.Spec.Source,
 		AppLabelKey:       appLabelKey,
 		AppLabelValue:     app.Name,
 		Namespace:         app.Spec.Destination.Namespace,
 	})
 	errors.CheckError(err)
-	objs := make([]*unstructured.Unstructured, len(res.Manifests))
-	for i := range res.Manifests {
-		obj := unstructured.Unstructured{}
-		err = json.Unmarshal([]byte(res.Manifests[i]), &obj)
-		errors.CheckError(err)
-		objs[i] = &obj
-	}
-	return objs
+
+	return res.Manifests
 }
 
 type resourceInfoProvider struct {
@@ -881,6 +924,44 @@ func NewApplicationDeleteCommand(clientOpts *argocdclient.ClientOptions) *cobra.
 	return command
 }
 
+// Print simple list of application names
+func printApplicationNames(apps []argoappv1.Application) {
+	for _, app := range apps {
+		fmt.Println(app.Name)
+	}
+}
+
+// Print table of application data
+func printApplicationTable(apps []argoappv1.Application, output *string) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	var fmtStr string
+	headers := []interface{}{"NAME", "CLUSTER", "NAMESPACE", "PROJECT", "STATUS", "HEALTH", "SYNCPOLICY", "CONDITIONS"}
+	if *output == "wide" {
+		fmtStr = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
+		headers = append(headers, "REPO", "PATH", "TARGET")
+	} else {
+		fmtStr = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
+	}
+	fmt.Fprintf(w, fmtStr, headers...)
+	for _, app := range apps {
+		vals := []interface{}{
+			app.Name,
+			app.Spec.Destination.Server,
+			app.Spec.Destination.Namespace,
+			app.Spec.GetProject(),
+			app.Status.Sync.Status,
+			app.Status.Health.Status,
+			formatSyncPolicy(app),
+			formatConditionsSummary(app),
+		}
+		if *output == "wide" {
+			vals = append(vals, app.Spec.Source.RepoURL, app.Spec.Source.Path, app.Spec.Source.TargetRevision)
+		}
+		fmt.Fprintf(w, fmtStr, vals...)
+	}
+	_ = w.Flush()
+}
+
 // NewApplicationListCommand returns a new instance of an `argocd app list` command
 func NewApplicationListCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
@@ -894,36 +975,14 @@ func NewApplicationListCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 			defer util.Close(conn)
 			apps, err := appIf.List(context.Background(), &applicationpkg.ApplicationQuery{})
 			errors.CheckError(err)
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			var fmtStr string
-			headers := []interface{}{"NAME", "CLUSTER", "NAMESPACE", "PROJECT", "STATUS", "HEALTH", "SYNCPOLICY", "CONDITIONS"}
-			if output == "wide" {
-				fmtStr = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
-				headers = append(headers, "REPO", "PATH", "TARGET")
+			if output == "name" {
+				printApplicationNames(apps.Items)
 			} else {
-				fmtStr = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
+				printApplicationTable(apps.Items, &output)
 			}
-			fmt.Fprintf(w, fmtStr, headers...)
-			for _, app := range apps.Items {
-				vals := []interface{}{
-					app.Name,
-					app.Spec.Destination.Server,
-					app.Spec.Destination.Namespace,
-					app.Spec.GetProject(),
-					app.Status.Sync.Status,
-					app.Status.Health.Status,
-					formatSyncPolicy(app),
-					formatConditionsSummary(app),
-				}
-				if output == "wide" {
-					vals = append(vals, app.Spec.Source.RepoURL, app.Spec.Source.Path, app.Spec.Source.TargetRevision)
-				}
-				fmt.Fprintf(w, fmtStr, vals...)
-			}
-			_ = w.Flush()
 		},
 	}
-	command.Flags().StringVarP(&output, "output", "o", "", "Output format. One of: wide")
+	command.Flags().StringVarP(&output, "output", "o", "wide", "Output format. One of: wide|name")
 	return command
 }
 
@@ -1084,6 +1143,8 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 		timeout   uint
 		strategy  string
 		force     bool
+		async     bool
+		local     string
 	)
 	var command = &cobra.Command{
 		Use:   "sync APPNAME",
@@ -1142,12 +1203,31 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 
 			selectedResources := parseSelectedResources(resources)
 
+			var localObjsStrings []string
+			if local != "" {
+				app, err := appIf.Get(context.Background(), &applicationpkg.ApplicationQuery{Name: &appName})
+
+				if app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.Automated != nil {
+					log.Fatal("Cannot use local sync when Automatic Sync Policy is enabled")
+				}
+
+				errors.CheckError(err)
+				conn, settingsIf := acdClient.NewSettingsClientOrDie()
+				argoSettings, err := settingsIf.Get(context.Background(), &settingspkg.SettingsQuery{})
+				errors.CheckError(err)
+				util.Close(conn)
+
+				localObjsStrings = getLocalObjectsString(app, local, argoSettings.AppLabelKey)
+
+			}
+
 			syncReq := applicationpkg.ApplicationSyncRequest{
 				Name:      &appName,
 				DryRun:    dryRun,
 				Revision:  revision,
 				Resources: selectedResources,
 				Prune:     prune,
+				Manifests: localObjsStrings,
 			}
 			switch strategy {
 			case "apply":
@@ -1163,18 +1243,20 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 			_, err := appIf.Sync(ctx, &syncReq)
 			errors.CheckError(err)
 
-			app, err := waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, selectedResources)
-			errors.CheckError(err)
+			if !async {
+				app, err := waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, selectedResources)
+				errors.CheckError(err)
 
-			// Only get resources to be pruned if sync was application-wide
-			if len(selectedResources) == 0 {
-				pruningRequired := app.Status.OperationState.SyncResult.Resources.PruningRequired()
-				if pruningRequired > 0 {
-					log.Fatalf("%d resources require pruning", pruningRequired)
-				}
+				// Only get resources to be pruned if sync was application-wide
+				if len(selectedResources) == 0 {
+					pruningRequired := app.Status.OperationState.SyncResult.Resources.PruningRequired()
+					if pruningRequired > 0 {
+						log.Fatalf("%d resources require pruning", pruningRequired)
+					}
 
-				if !app.Status.OperationState.Phase.Successful() && !dryRun {
-					os.Exit(1)
+					if !app.Status.OperationState.Phase.Successful() && !dryRun {
+						os.Exit(1)
+					}
 				}
 			}
 		},
@@ -1187,6 +1269,8 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().UintVar(&timeout, "timeout", defaultCheckTimeoutSeconds, "Time out after this many seconds")
 	command.Flags().StringVar(&strategy, "strategy", "", "Sync strategy (one of: apply|hook)")
 	command.Flags().BoolVar(&force, "force", false, "Use a force apply")
+	command.Flags().BoolVar(&async, "async", false, "Do not wait for application to sync before continuing")
+	command.Flags().StringVar(&local, "local", "", "Path to a local directory. When this flag is present no git queries will be made")
 	return command
 }
 
@@ -1504,6 +1588,27 @@ func setParameterOverrides(app *argoappv1.Application, parameters []string) {
 	}
 }
 
+// Print list of history ID's for an application.
+func printApplicationHistoryIds(revHistory []argoappv1.RevisionHistory) {
+	for _, depInfo := range revHistory {
+		fmt.Println(depInfo.ID)
+	}
+}
+
+// Print a history table for an application.
+func printApplicationHistoryTable(revHistory []argoappv1.RevisionHistory, output *string) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "ID\tDATE\tREVISION\n")
+	for _, depInfo := range revHistory {
+		rev := depInfo.Source.TargetRevision
+		if len(depInfo.Revision) >= 7 {
+			rev = fmt.Sprintf("%s (%s)", rev, depInfo.Revision[0:7])
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\n", depInfo.ID, depInfo.DeployedAt, rev)
+	}
+	_ = w.Flush()
+}
+
 // NewApplicationHistoryCommand returns a new instance of an `argocd app history` command
 func NewApplicationHistoryCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
@@ -1522,19 +1627,14 @@ func NewApplicationHistoryCommand(clientOpts *argocdclient.ClientOptions) *cobra
 			appName := args[0]
 			app, err := appIf.Get(context.Background(), &applicationpkg.ApplicationQuery{Name: &appName})
 			errors.CheckError(err)
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintf(w, "ID\tDATE\tREVISION\n")
-			for _, depInfo := range app.Status.History {
-				rev := depInfo.Source.TargetRevision
-				if len(depInfo.Revision) >= 7 {
-					rev = fmt.Sprintf("%s (%s)", rev, depInfo.Revision[0:7])
-				}
-				fmt.Fprintf(w, "%d\t%s\t%s\n", depInfo.ID, depInfo.DeployedAt, rev)
+			if output == "id" {
+				printApplicationHistoryIds(app.Status.History)
+			} else {
+				printApplicationHistoryTable(app.Status.History, &output)
 			}
-			_ = w.Flush()
 		},
 	}
-	command.Flags().StringVarP(&output, "output", "o", "", "Output format. One of: wide")
+	command.Flags().StringVarP(&output, "output", "o", "wide", "Output format. One of: wide|id")
 	return command
 }
 

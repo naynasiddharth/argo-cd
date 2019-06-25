@@ -30,7 +30,7 @@ type Application struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata" protobuf:"bytes,1,opt,name=metadata"`
 	Spec              ApplicationSpec   `json:"spec" protobuf:"bytes,2,opt,name=spec"`
-	Status            ApplicationStatus `json:"status" protobuf:"bytes,3,opt,name=status"`
+	Status            ApplicationStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 	Operation         *Operation        `json:"operation,omitempty" protobuf:"bytes,4,opt,name=operation"`
 }
 
@@ -269,6 +269,8 @@ type SyncOperation struct {
 	// Source overrides the source definition set in the application.
 	// This is typically set in a Rollback operation and nil during a Sync operation
 	Source *ApplicationSource `json:"source,omitempty" protobuf:"bytes,7,opt,name=source"`
+	// Manifests is an optional field that overrides sync source with a local directory for development
+	Manifests []string `json:"manifests,omitempty" protobuf:"bytes,8,opt,name=manifests"`
 }
 
 func (o *SyncOperation) IsApplyStrategy() bool {
@@ -387,6 +389,23 @@ const (
 	HookDeletePolicyHookFailed    HookDeletePolicy = "HookFailed"
 )
 
+// data about a specific revision within a repo
+type RevisionMetadata struct {
+	// who authored this revision,
+	// typically their name and email, e.g. "John Doe <john_doe@my-company.com>",
+	// but might not match this example
+	Author string `json:"author" protobuf:"bytes,1,opt,name=author"`
+	// when the revision was authored
+	Date metav1.Time `json:"date" protobuf:"bytes,2,opt,name=date"`
+	// tags on the revision,
+	// note - tags can move from one revision to another
+	Tags []string `json:"tags" protobuf:"bytes,3,opt,name=tags"`
+	// the message associated with the revision,
+	// probably the commit message,
+	// this is truncated to the first newline or 64 characters (which ever comes first)
+	Message string `json:"message" protobuf:"bytes,4,opt,name=message"`
+}
+
 // SyncOperationResult represent result of sync operation
 type SyncOperationResult struct {
 	// Resources holds the sync result of each individual resource
@@ -394,7 +413,7 @@ type SyncOperationResult struct {
 	// Revision holds the git commit SHA of the sync
 	Revision string `json:"revision" protobuf:"bytes,2,opt,name=revision"`
 	// Source records the application source information of the sync, used for comparing auto-sync
-	Source ApplicationSource `json:"source" protobuf:"bytes,3,opt,name=source"`
+	Source ApplicationSource `json:"source,omitempty" protobuf:"bytes,3,opt,name=source"`
 }
 
 type ResultCode string
@@ -476,7 +495,7 @@ type RevisionHistory struct {
 	Revision   string            `json:"revision" protobuf:"bytes,2,opt,name=revision"`
 	DeployedAt metav1.Time       `json:"deployedAt" protobuf:"bytes,4,opt,name=deployedAt"`
 	ID         int64             `json:"id" protobuf:"bytes,5,opt,name=id"`
-	Source     ApplicationSource `json:"source" protobuf:"bytes,6,opt,name=source"`
+	Source     ApplicationSource `json:"source,omitempty" protobuf:"bytes,6,opt,name=source"`
 }
 
 // ApplicationWatchEvent contains information about application change.
@@ -556,8 +575,8 @@ type ComparedTo struct {
 // SyncStatus is a comparison result of application spec and deployed application.
 type SyncStatus struct {
 	Status     SyncStatusCode `json:"status" protobuf:"bytes,1,opt,name=status,casttype=SyncStatusCode"`
-	ComparedTo ComparedTo     `json:"comparedTo" protobuf:"bytes,2,opt,name=comparedTo"`
-	Revision   string         `json:"revision" protobuf:"bytes,3,opt,name=revision"`
+	ComparedTo ComparedTo     `json:"comparedTo,omitempty" protobuf:"bytes,2,opt,name=comparedTo"`
+	Revision   string         `json:"revision,omitempty" protobuf:"bytes,3,opt,name=revision"`
 }
 
 type HealthStatus struct {
@@ -837,11 +856,13 @@ func (m *Repository) HasCredentials() bool {
 	return m.Username != "" || m.Password != "" || m.SSHPrivateKey != "" || m.InsecureIgnoreHostKey
 }
 
-func (m *Repository) CopyCredentialsFrom(source Repository) {
-	m.Username = source.Username
-	m.Password = source.Password
-	m.SSHPrivateKey = source.SSHPrivateKey
-	m.InsecureIgnoreHostKey = source.InsecureIgnoreHostKey
+func (m *Repository) CopyCredentialsFrom(source *Repository) {
+	if source != nil {
+		m.Username = source.Username
+		m.Password = source.Password
+		m.SSHPrivateKey = source.SSHPrivateKey
+		m.InsecureIgnoreHostKey = source.InsecureIgnoreHostKey
+	}
 }
 
 // RepositoryList is a collection of Repositories.

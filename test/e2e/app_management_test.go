@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"testing"
@@ -27,7 +28,8 @@ import (
 )
 
 const (
-	guestbookPath = "guestbook"
+	guestbookPath      = "guestbook"
+	guestbookPathLocal = "./testdata/guestbook_local"
 )
 
 func TestAppCreation(t *testing.T) {
@@ -51,6 +53,16 @@ func TestAppCreation(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Contains(t, output, fixture.Name())
 		})
+}
+
+func TestInvalidAppProject(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		Project("does-not-exist").
+		When().
+		Create().
+		Then().
+		Expect(Error("application references project does-not-exist which does not exist"))
 }
 
 func TestAppDeletion(t *testing.T) {
@@ -429,12 +441,78 @@ func TestSyncResourceByLabel(t *testing.T) {
 		Sync().
 		Then().
 		And(func(app *Application) {
-			res, _ := fixture.RunCli("app", "sync", app.Name, "--label", fmt.Sprintf("app.kubernetes.io/instance=%s", app.Name))
-			assert.Contains(t, res, "guestbook-ui  Synced  Healthy")
-
-			res, _ = fixture.RunCli("app", "sync", app.Name, "--label", "this-label=does-not-exist")
+			_, _ = fixture.RunCli("app", "sync", app.Name, "--label", fmt.Sprintf("app.kubernetes.io/instance=%s", app.Name))
+		}).
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		And(func(app *Application) {
+			res, _ := fixture.RunCli("app", "sync", app.Name, "--label", "this-label=does-not-exist")
 			assert.Contains(t, res, "level=fatal")
 		})
+}
+
+func TestLocalManifestSync(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		When().
+		Create().
+		Sync().
+		Then().
+		And(func(app *Application) {
+			res, _ := fixture.RunCli("app", "manifests", app.Name)
+			assert.Contains(t, res, "containerPort: 80")
+			assert.Contains(t, res, "image: gcr.io/heptio-images/ks-guestbook-demo:0.2")
+		}).
+		Given().
+		LocalPath(guestbookPathLocal).
+		When().
+		Sync().
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		And(func(app *Application) {
+			res, _ := fixture.RunCli("app", "manifests", app.Name)
+			assert.Contains(t, res, "containerPort: 81")
+			assert.Contains(t, res, "image: gcr.io/heptio-images/ks-guestbook-demo:0.3")
+		}).
+		Given().
+		LocalPath("").
+		When().
+		Sync().
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		And(func(app *Application) {
+			res, _ := fixture.RunCli("app", "manifests", app.Name)
+			assert.Contains(t, res, "containerPort: 80")
+			assert.Contains(t, res, "image: gcr.io/heptio-images/ks-guestbook-demo:0.2")
+		})
+}
+
+func TestNoLocalSyncWithAutosyncEnabled(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		When().
+		Create().
+		Sync().
+		Then().
+		And(func(app *Application) {
+			_, err := fixture.RunCli("app", "set", app.Name, "--sync-policy", "automated")
+			assert.NoError(t, err)
+
+			_, err = fixture.RunCli("app", "sync", app.Name, "--local", guestbookPathLocal)
+			assert.Error(t, err)
+		})
+}
+
+func TestSyncAsync(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		Async(true).
+		When().
+		Create().
+		Sync().
+		Then().
+		Expect(Success("")).
+		Expect(OperationPhaseIs(OperationSucceeded)).
+		Expect(SyncStatusIs(SyncStatusCodeSynced))
 }
 
 func TestPermissions(t *testing.T) {
@@ -516,6 +594,33 @@ func TestSyncOptionPruneFalse(t *testing.T) {
 		Expect(OperationPhaseIs(OperationSucceeded)).
 		Expect(SyncStatusIs(SyncStatusCodeOutOfSync)).
 		Expect(ResourceSyncStatusIs("Pod", "pod-1", SyncStatusCodeOutOfSync))
+}
+
+// make sure that if we have an invalid manifest, we can add it if we disable validation, we get a server error rather than a client error
+func TestSyncOptionValidateFalse(t *testing.T) {
+
+	// k3s does not validate at all, so this test does not work
+	if os.Getenv("ARGOCD_E2E_K3S") == "true" {
+		t.SkipNow()
+	}
+
+	Given(t).
+		Path("crd-validation").
+		When().
+		Create().
+		Then().
+		Expect(Success("")).
+		When().
+		Sync().
+		Then().
+		// client error
+		Expect(Error("error validating data")).
+		When().
+		PatchFile("deployment.yaml", `[{"op": "add", "path": "/metadata/annotations", "value": {"argocd.argoproj.io/sync-options": "Validate=false"}}]`).
+		Sync().
+		Then().
+		// server error
+		Expect(Error("Error from server"))
 }
 
 // make sure that, if we have a resource that needs pruning, but we're ignoring it, the app is in-sync

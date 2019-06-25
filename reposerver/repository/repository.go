@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/argoproj/argo-cd/util/ksonnet"
 	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/kustomize"
+	"github.com/argoproj/argo-cd/util/text"
 )
 
 const (
@@ -170,9 +172,8 @@ func (s *Service) GenerateManifest(c context.Context, q *ManifestRequest) (*Mani
 	if err != nil {
 		return nil, err
 	}
-	appPath := filepath.Join(gitClient.Root(), q.ApplicationSource.Path)
 
-	genRes, err := GenerateManifests(appPath, q)
+	genRes, err := GenerateManifests(gitClient.Root(), q.ApplicationSource.Path, q)
 	if err != nil {
 		return nil, err
 	}
@@ -185,8 +186,28 @@ func (s *Service) GenerateManifest(c context.Context, q *ManifestRequest) (*Mani
 	return &res, nil
 }
 
+func checkPath(root, path string) error {
+	info, err := os.Stat(filepath.Join(root, path))
+	if os.IsNotExist(err) {
+		return fmt.Errorf("%s: app path does not exist", path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s: app path is not a directory", path)
+	}
+	return nil
+}
+
 // GenerateManifests generates manifests from a path
-func GenerateManifests(appPath string, q *ManifestRequest) (*ManifestResponse, error) {
+func GenerateManifests(root, path string, q *ManifestRequest) (*ManifestResponse, error) {
+	err := checkPath(root, path)
+	if err != nil {
+		return nil, err
+	}
+
+	appPath := filepath.Join(root, path)
 	var targetObjs []*unstructured.Unstructured
 	var dest *v1alpha1.ApplicationDestination
 
@@ -489,9 +510,7 @@ func pathExists(ss ...string) bool {
 // newClientResolveRevision is a helper to perform the common task of instantiating a git client
 // and resolving a revision to a commit SHA
 func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision string) (git.Client, string, error) {
-	repoURL := git.NormalizeGitURL(repo.Repo)
-	appRepoPath := tempRepoPath(repoURL)
-	gitClient, err := s.gitFactory.NewClient(repo.Repo, appRepoPath, repo.Username, repo.Password, repo.SSHPrivateKey, repo.InsecureIgnoreHostKey)
+	gitClient, err := s.newClient(repo)
 	if err != nil {
 		return nil, "", err
 	}
@@ -500,6 +519,11 @@ func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision s
 		return nil, "", err
 	}
 	return gitClient, commitSHA, nil
+}
+
+func (s *Service) newClient(repo *v1alpha1.Repository) (git.Client, error) {
+	appPath := tempRepoPath(git.NormalizeGitURL(repo.Repo))
+	return s.gitFactory.NewClient(repo.Repo, appPath, repo.Username, repo.Password, repo.SSHPrivateKey, repo.InsecureIgnoreHostKey)
 }
 
 func runCommand(command v1alpha1.Command, path string, env []string) (string, error) {
@@ -512,7 +536,7 @@ func runCommand(command v1alpha1.Command, path string, env []string) (string, er
 	return argoexec.RunCommandExt(cmd)
 }
 
-func runConfigManagementPlugin(appPath string, q *ManifestRequest, creds *git.Creds, plugins []*v1alpha1.ConfigManagementPlugin) ([]*unstructured.Unstructured, error) {
+func runConfigManagementPlugin(appPath string, q *ManifestRequest, creds git.Creds, plugins []*v1alpha1.ConfigManagementPlugin) ([]*unstructured.Unstructured, error) {
 	var plugin *v1alpha1.ConfigManagementPlugin
 	for i := range plugins {
 		if plugins[i].Name == q.ApplicationSource.Plugin.Name {
@@ -525,10 +549,12 @@ func runConfigManagementPlugin(appPath string, q *ManifestRequest, creds *git.Cr
 	}
 	env := append(os.Environ(), fmt.Sprintf("%s=%s", PluginEnvAppName, q.AppLabelValue), fmt.Sprintf("%s=%s", PluginEnvAppNamespace, q.Namespace))
 	if creds != nil {
-		env = append(env,
-			"GIT_ASKPASS=git-ask-pass.sh",
-			fmt.Sprintf("GIT_USERNAME=%s", creds.Username),
-			fmt.Sprintf("GIT_PASSWORD=%s", creds.Password))
+		closer, environ, err := creds.Environ()
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = closer.Close() }()
+		env = append(env, environ...)
 	}
 	if plugin.Init != nil {
 		_, err := runCommand(*plugin.Init, appPath, env)
@@ -659,6 +685,46 @@ func (s *Service) GetAppDetails(ctx context.Context, q *RepoServerAppDetailsQuer
 	return &res, nil
 }
 
+func (s *Service) getRevisionMetadata(repoURL *v1alpha1.Repository, revision string) (*git.RevisionMetadata, error) {
+	client, err := s.newClient(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	s.repoLock.Lock(client.Root())
+	defer s.repoLock.Unlock(client.Root())
+	err = client.Init()
+	if err != nil {
+		return nil, err
+	}
+	err = client.Fetch()
+	if err != nil {
+		return nil, err
+	}
+	return client.RevisionMetadata(revision)
+}
+
+func (s *Service) GetRevisionMetadata(ctx context.Context, q *RepoServerRevisionMetadataRequest) (*v1alpha1.RevisionMetadata, error) {
+	metadata, err := s.cache.GetRevisionMetadata(q.Repo.Repo, q.Revision)
+	if err == nil {
+		log.WithFields(log.Fields{"repoURL": q.Repo.Repo, "revision": q.Revision}).Debug("cache hit")
+		return metadata, nil
+	}
+	if err == cache.ErrCacheMiss {
+		log.WithFields(log.Fields{"repoURL": q.Repo.Repo, "revision": q.Revision}).Debug("cache miss")
+		gitMetadata, err := s.getRevisionMetadata(q.Repo, q.Revision)
+		if err != nil {
+			return nil, err
+		}
+		// discard anything after the first new line and then truncate to 64 chars
+		message := text.Trunc(strings.SplitN(gitMetadata.Message, "\n", 2)[0], 64)
+		metadata = &v1alpha1.RevisionMetadata{Author: gitMetadata.Author, Date: metav1.Time{Time: gitMetadata.Date}, Tags: gitMetadata.Tags, Message: message}
+		_ = s.cache.SetRevisionMetadata(q.Repo.Repo, q.Revision, metadata)
+		return metadata, nil
+	}
+	log.WithFields(log.Fields{"repoURL": q.Repo.Repo, "revision": q.Revision, "err": err}).Debug("cache error")
+	return nil, err
+}
+
 func kustomizeImageTags(imageTags []kustomize.ImageTag) []*v1alpha1.KustomizeImageTag {
 	output := make([]*v1alpha1.KustomizeImageTag, len(imageTags))
 	for i, imageTag := range imageTags {
@@ -674,12 +740,15 @@ func (q *RepoServerAppDetailsQuery) valueFiles() []string {
 	return q.Helm.ValueFiles
 }
 
-func newCreds(repo *v1alpha1.Repository) *git.Creds {
-	if repo == nil || repo.Password == "" {
-		return nil
+func newCreds(repo *v1alpha1.Repository) git.Creds {
+	if repo == nil {
+		return git.NopCreds{}
 	}
-	return &git.Creds{
-		Username: repo.Username,
-		Password: repo.Password,
+	if repo.Username != "" && repo.Password != "" {
+		return git.NewHTTPSCreds(repo.Username, repo.Password)
 	}
+	if repo.SSHPrivateKey != "" {
+		return git.NewSSHCreds(repo.SSHPrivateKey, repo.InsecureIgnoreHostKey)
+	}
+	return git.NopCreds{}
 }

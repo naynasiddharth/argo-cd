@@ -41,3 +41,26 @@ func TestHelmCrdInstallIsCreated(t *testing.T) {
 			return p.Name == "hook"
 		}))
 }
+
+func TestDeclarativeHelm(t *testing.T) {
+	Given(t).
+		Path("helm").
+		When().
+		Declarative("declarative-apps/app.yaml").
+		Sync().
+		Then().
+		Expect(OperationPhaseIs(OperationSucceeded)).
+		Expect(HealthIs(HealthStatusHealthy)).
+		Expect(SyncStatusIs(SyncStatusCodeSynced))
+}
+
+func TestDeclarativeHelmInvalidValuesFile(t *testing.T) {
+	Given(t).
+		Path("helm").
+		When().
+		Declarative("declarative-apps/invalid-helm.yaml").
+		Then().
+		Expect(HealthIs(HealthStatusHealthy)).
+		Expect(SyncStatusIs(SyncStatusCodeUnknown)).
+		Expect(Condition(ApplicationConditionComparisonError, "open does-not-exist-values.yaml: no such file or directory"))
+}

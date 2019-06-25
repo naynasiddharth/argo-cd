@@ -92,7 +92,7 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 		revision = syncOp.Revision
 	}
 
-	compareResult, err := m.CompareAppState(app, revision, source, false)
+	compareResult, err := m.CompareAppState(app, revision, source, false, syncOp.Manifests)
 	if err != nil {
 		state.Phase = v1alpha1.OperationError
 		state.Message = err.Error()
@@ -144,8 +144,15 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 		return
 	}
 
+	resourceOverrides, err := m.settingsMgr.GetResourceOverrides()
+	if err != nil {
+		state.Phase = v1alpha1.OperationError
+		state.Message = fmt.Sprintf("Failed to load resource overrides: %v", err)
+		return
+	}
+
 	syncCtx := syncContext{
-		resourceOverrides: m.settings.ResourceOverrides,
+		resourceOverrides: resourceOverrides,
 		appName:           app.Name,
 		proj:              proj,
 		compareResult:     compareResult,
@@ -457,7 +464,8 @@ func (sc *syncContext) liveObj(obj *unstructured.Unstructured) *unstructured.Uns
 	for _, resource := range sc.compareResult.managedResources {
 		if resource.Group == obj.GroupVersionKind().Group &&
 			resource.Kind == obj.GetKind() &&
-			resource.Namespace == obj.GetNamespace() &&
+			// cluster scoped objects will not have a namespace, even if the user has defined it
+			(resource.Namespace == "" || resource.Namespace == obj.GetNamespace()) &&
 			resource.Name == obj.GetName() {
 			return resource.Live
 		}
@@ -475,7 +483,8 @@ func (sc *syncContext) setOperationPhase(phase v1alpha1.OperationPhase, message 
 
 // applyObject performs a `kubectl apply` of a single resource
 func (sc *syncContext) applyObject(targetObj *unstructured.Unstructured, dryRun bool, force bool) (v1alpha1.ResultCode, string) {
-	message, err := sc.kubectl.ApplyResource(sc.config, targetObj, targetObj.GetNamespace(), dryRun, force)
+	validate := !resource.HasAnnotationOption(targetObj, common.AnnotationSyncOptions, "Validate=false")
+	message, err := sc.kubectl.ApplyResource(sc.config, targetObj, targetObj.GetNamespace(), dryRun, force, validate)
 	if err != nil {
 		return v1alpha1.ResultCodeSyncFailed, err.Error()
 	}

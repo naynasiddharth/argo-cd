@@ -178,7 +178,7 @@ func (s *Server) GetManifests(ctx context.Context, q *application.ApplicationMan
 	if q.Revision != "" {
 		revision = q.Revision
 	}
-	settings, err := s.settingsMgr.GetSettings()
+	appInstanceLabelKey, err := s.settingsMgr.GetAppInstanceLabelKey()
 	if err != nil {
 		return nil, err
 	}
@@ -186,14 +186,20 @@ func (s *Server) GetManifests(ctx context.Context, q *application.ApplicationMan
 	if err != nil {
 		return nil, err
 	}
-	tools := make([]*appv1.ConfigManagementPlugin, len(settings.ConfigManagementPlugins))
-	for i := range settings.ConfigManagementPlugins {
-		tools[i] = &settings.ConfigManagementPlugins[i]
+
+	plugins, err := s.settingsMgr.GetConfigManagementPlugins()
+	if err != nil {
+		return nil, err
+	}
+
+	tools := make([]*appv1.ConfigManagementPlugin, len(plugins))
+	for i := range plugins {
+		tools[i] = &plugins[i]
 	}
 	manifestInfo, err := repoClient.GenerateManifest(ctx, &repository.ManifestRequest{
 		Repo:              repo,
 		Revision:          revision,
-		AppLabelKey:       settings.GetAppInstanceLabelKey(),
+		AppLabelKey:       appInstanceLabelKey,
 		AppLabelValue:     a.Name,
 		Namespace:         a.Spec.Destination.Namespace,
 		ApplicationSource: &a.Spec.Source,
@@ -353,7 +359,7 @@ func (s *Server) Patch(ctx context.Context, q *application.ApplicationPatchReque
 		return nil, err
 	}
 
-	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionUpdate, appRBACName(*app)); err != nil {
+	if err = s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionOverride, appRBACName(*app)); err != nil {
 		return nil, err
 	}
 
@@ -707,6 +713,26 @@ func (s *Server) ResourceTree(ctx context.Context, q *application.ResourcesQuery
 	return s.getAppResources(ctx, q)
 }
 
+func (s *Server) RevisionMetadata(ctx context.Context, q *application.RevisionMetadataQuery) (*v1alpha1.RevisionMetadata, error) {
+	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(q.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(*a)); err != nil {
+		return nil, err
+	}
+	repo, err := s.db.GetRepository(ctx, a.Spec.Source.RepoURL)
+	if err != nil {
+		return nil, err
+	}
+	conn, repoClient, err := s.repoClientset.NewRepoServerClient()
+	if err != nil {
+		return nil, err
+	}
+	defer util.Close(conn)
+	return repoClient.GetRevisionMetadata(ctx, &repository.RepoServerRevisionMetadataRequest{Repo: repo, Revision: q.GetRevision()})
+}
+
 func (s *Server) ManagedResources(ctx context.Context, q *application.ResourcesQuery) (*application.ManagedResourcesResponse, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.ApplicationName, metav1.GetOptions{})
 	if err != nil {
@@ -822,6 +848,14 @@ func (s *Server) Sync(ctx context.Context, syncReq *application.ApplicationSyncR
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionSync, appRBACName(*a)); err != nil {
 		return nil, err
 	}
+	if syncReq.Manifests != nil {
+		if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionOverride, appRBACName(*a)); err != nil {
+			return nil, err
+		}
+		if a.Spec.SyncPolicy != nil {
+			return nil, status.Error(codes.FailedPrecondition, "Cannot use local sync when Automatic Sync Policy is enabled")
+		}
+	}
 	if a.DeletionTimestamp != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "application is deleting")
 	}
@@ -843,6 +877,7 @@ func (s *Server) Sync(ctx context.Context, syncReq *application.ApplicationSyncR
 			DryRun:       syncReq.DryRun,
 			SyncStrategy: syncReq.Strategy,
 			Resources:    syncReq.Resources,
+			Manifests:    syncReq.Manifests,
 		},
 	}
 	a, err = argo.SetAppOperation(appIf, *syncReq.Name, &op)

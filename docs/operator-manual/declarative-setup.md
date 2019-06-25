@@ -26,6 +26,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: guestbook
+  namespace: argocd
 spec:
   project: default
   source:
@@ -70,6 +71,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
   name: my-project
+  namespace: argocd
 spec:
   description: Example Project
   # Allow manifests to deploy from any Git repos
@@ -126,6 +128,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: argocd-cm
+  namespace: argocd
 data:
   repositories: |
     - url: https://github.com/argoproj/my-private-repository
@@ -144,6 +147,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: argocd-cm
+  namespace: argocd
 data:
   repositories: |
     - url: git@github.com:argoproj/my-private-repository
@@ -156,7 +160,9 @@ data:
     The Kubernetes documentation has [instructions for creating a secret containing a private key](https://kubernetes.io/docs/concepts/configuration/secret/#use-case-pod-with-ssh-keys). 
 
 
-### Repository Credentials (v1.1+)
+### Repository Credentials
+ 
+>v1.1
 
 If you want to use the same credentials for multiple repositories, you can use `repository.credentials`:
 
@@ -165,6 +171,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: argocd-cm
+  namespace: argocd
 data:
   repositories: |
     - url: https://github.com/argoproj/private-repo
@@ -193,6 +200,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: argocd-cm
+  namespace: argocd
 data:
   repositories: |
     # this has it's own credentials
@@ -309,6 +317,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: argocd-cm
+  namespace: argocd
 data:
   helm.repositories: |
     - url: https://storage.googleapis.com/istio-prerelease/daily-build/master-latest-daily/charts

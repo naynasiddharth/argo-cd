@@ -64,7 +64,6 @@ type ApplicationController struct {
 	statusRefreshTimeout      time.Duration
 	repoClientset             reposerver.Clientset
 	db                        db.ArgoDB
-	settings                  *settings_util.ArgoCDSettings
 	settingsMgr               *settings_util.SettingsManager
 	refreshRequestedApps      map[string]bool
 	refreshRequestedAppsMutex *sync.Mutex
@@ -88,10 +87,6 @@ func NewApplicationController(
 	metricsPort int,
 ) (*ApplicationController, error) {
 	db := db.NewDB(namespace, settingsMgr, kubeClientset)
-	settings, err := settingsMgr.GetSettings()
-	if err != nil {
-		return nil, err
-	}
 	kubectlCmd := kube.KubectlCmd{}
 	ctrl := ApplicationController{
 		cache:                     argoCache,
@@ -108,14 +103,16 @@ func NewApplicationController(
 		refreshRequestedAppsMutex: &sync.Mutex{},
 		auditLogger:               argo.NewAuditLogger(namespace, kubeClientset, "argocd-application-controller"),
 		settingsMgr:               settingsMgr,
-		settings:                  settings,
 	}
 	appInformer, appLister := ctrl.newApplicationInformerAndLister()
 	projInformer := v1alpha1.NewAppProjectInformer(applicationClientset, namespace, appResyncPeriod, cache.Indexers{})
 	metricsAddr := fmt.Sprintf("0.0.0.0:%d", metricsPort)
-	ctrl.metricsServer = metrics.NewMetricsServer(metricsAddr, appLister)
-	stateCache := statecache.NewLiveStateCache(db, appInformer, ctrl.settings, kubectlCmd, ctrl.metricsServer, ctrl.handleAppUpdated)
-	appStateManager := NewAppStateManager(db, applicationClientset, repoClientset, namespace, kubectlCmd, ctrl.settings, stateCache, projInformer, ctrl.metricsServer)
+	ctrl.metricsServer = metrics.NewMetricsServer(metricsAddr, appLister, func() error {
+		_, err := kubeClientset.Discovery().ServerVersion()
+		return err
+	})
+	stateCache := statecache.NewLiveStateCache(db, appInformer, ctrl.settingsMgr, kubectlCmd, ctrl.metricsServer, ctrl.handleAppUpdated)
+	appStateManager := NewAppStateManager(db, applicationClientset, repoClientset, namespace, kubectlCmd, ctrl.settingsMgr, stateCache, projInformer, ctrl.metricsServer)
 	ctrl.appInformer = appInformer
 	ctrl.appLister = appLister
 	ctrl.projInformer = projInformer
@@ -264,14 +261,13 @@ func (ctrl *ApplicationController) Run(ctx context.Context, statusProcessors int
 
 	go ctrl.appInformer.Run(ctx.Done())
 	go ctrl.projInformer.Run(ctx.Done())
-	go ctrl.watchSettings(ctx)
 
 	if !cache.WaitForCacheSync(ctx.Done(), ctrl.appInformer.HasSynced, ctrl.projInformer.HasSynced) {
 		log.Error("Timed out waiting for caches to sync")
 		return
 	}
 
-	go ctrl.stateCache.Run(ctx)
+	go func() { errors.CheckError(ctrl.stateCache.Run(ctx)) }()
 	go func() { errors.CheckError(ctrl.metricsServer.ListenAndServe()) }()
 
 	for i := 0; i < statusProcessors; i++ {
@@ -494,6 +490,7 @@ func (ctrl *ApplicationController) processRequestedAppOperation(app *appv1.Appli
 		ctrl.setOperationState(app, state)
 		logCtx.Infof("Initialized new operation: %v", *app.Operation)
 	}
+
 	ctrl.appStateManager.SyncAppState(app, state)
 
 	if state.Phase == appv1.OperationRunning {
@@ -654,7 +651,12 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 		return
 	}
 
-	compareResult, err := ctrl.appStateManager.CompareAppState(app, "", app.Spec.Source, refreshType == appv1.RefreshTypeHard)
+	var localManifests []string
+	if opState := app.Status.OperationState; opState != nil {
+		localManifests = opState.Operation.Sync.Manifests
+	}
+
+	compareResult, err := ctrl.appStateManager.CompareAppState(app, "", app.Spec.Source, refreshType == appv1.RefreshTypeHard, localManifests)
 	if err != nil {
 		conditions = append(conditions, appv1.ApplicationCondition{Type: appv1.ApplicationConditionComparisonError, Message: err.Error()})
 	} else {
@@ -964,46 +966,4 @@ func toggledAutomatedSync(old *appv1.Application, new *appv1.Application) bool {
 	}
 	// nothing changed
 	return false
-}
-
-func (ctrl *ApplicationController) watchSettings(ctx context.Context) {
-	updateCh := make(chan *settings_util.ArgoCDSettings, 1)
-	ctrl.settingsMgr.Subscribe(updateCh)
-	prevAppLabelKey := ctrl.settings.GetAppInstanceLabelKey()
-	prevResourceExclusions := ctrl.settings.ResourceExclusions
-	prevResourceInclusions := ctrl.settings.ResourceInclusions
-	prevConfigManagementPlugins := ctrl.settings.ConfigManagementPlugins
-	done := false
-	for !done {
-		select {
-		case newSettings := <-updateCh:
-			newAppLabelKey := newSettings.GetAppInstanceLabelKey()
-			*ctrl.settings = *newSettings
-			if prevAppLabelKey != newAppLabelKey {
-				log.Infof("label key changed: %s -> %s", prevAppLabelKey, newAppLabelKey)
-				ctrl.stateCache.Invalidate()
-				prevAppLabelKey = newAppLabelKey
-			}
-			if !reflect.DeepEqual(prevResourceExclusions, newSettings.ResourceExclusions) {
-				log.WithFields(log.Fields{"prevResourceExclusions": prevResourceExclusions, "newResourceExclusions": newSettings.ResourceExclusions}).Info("resource exclusions modified")
-				ctrl.stateCache.Invalidate()
-				prevResourceExclusions = newSettings.ResourceExclusions
-			}
-			if !reflect.DeepEqual(prevResourceInclusions, newSettings.ResourceInclusions) {
-				log.WithFields(log.Fields{"prevResourceInclusions": prevResourceInclusions, "newResourceInclusions": newSettings.ResourceInclusions}).Info("resource inclusions modified")
-				ctrl.stateCache.Invalidate()
-				prevResourceInclusions = newSettings.ResourceInclusions
-			}
-			if !reflect.DeepEqual(prevConfigManagementPlugins, newSettings.ConfigManagementPlugins) {
-				log.WithFields(log.Fields{"prevConfigManagementPlugins": prevConfigManagementPlugins, "newConfigManagementPlugins": newSettings.ConfigManagementPlugins}).Info("config management plugins modified")
-				ctrl.stateCache.Invalidate()
-				prevConfigManagementPlugins = newSettings.ConfigManagementPlugins
-			}
-		case <-ctx.Done():
-			done = true
-		}
-	}
-	log.Info("shutting down settings watch")
-	ctrl.settingsMgr.Unsubscribe(updateCh)
-	close(updateCh)
 }

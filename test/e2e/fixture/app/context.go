@@ -6,25 +6,41 @@ import (
 	. "github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/test/e2e/fixture"
+	"github.com/argoproj/argo-cd/test/e2e/fixture/repos"
+	"github.com/argoproj/argo-cd/util/settings"
 )
 
 // this implements the "given" part of given/when/then
 type Context struct {
-	t                      *testing.T
-	path                   string
+	t    *testing.T
+	path string
+	// seconds
+	timeout                int
 	name                   string
 	destServer             string
 	env                    string
 	parameters             []string
+	jsonnetTLAS            []string
 	namePrefix             string
 	resource               string
 	prune                  bool
 	configManagementPlugin string
+	async                  bool
+	localPath              string
+	project                string
 }
 
 func Given(t *testing.T) *Context {
 	fixture.EnsureCleanState(t)
-	return &Context{t: t, destServer: KubernetesInternalAPIServerAddr, name: fixture.Name(), prune: true}
+	return &Context{t: t, destServer: KubernetesInternalAPIServerAddr, name: fixture.Name(), timeout: 5, project: "default", prune: true}
+}
+
+func (c *Context) SSHRepo() *Context {
+	return c.Repo(repos.AddSSHRepo())
+}
+
+func (c *Context) HTTPSRepo() *Context {
+	return c.Repo(repos.AddHTTPSRepo())
 }
 
 func (c *Context) Repo(url string) *Context {
@@ -34,6 +50,11 @@ func (c *Context) Repo(url string) *Context {
 
 func (c *Context) Path(path string) *Context {
 	c.path = path
+	return c
+}
+
+func (c *Context) Timeout(timeout int) *Context {
+	c.timeout = timeout
 	return c
 }
 
@@ -49,6 +70,11 @@ func (c *Context) Env(env string) *Context {
 
 func (c *Context) Parameter(parameter string) *Context {
 	c.parameters = append(c.parameters, parameter)
+	return c
+}
+
+func (c *Context) JsonnetTlaParameter(parameter string) *Context {
+	c.jsonnetTLAS = append(c.jsonnetTLAS, parameter)
 	return c
 }
 
@@ -70,8 +96,13 @@ func (c *Context) ResourceOverrides(overrides map[string]v1alpha1.ResourceOverri
 
 // this both configures the plugin, but forces use of it
 func (c *Context) ConfigManagementPlugin(plugin v1alpha1.ConfigManagementPlugin) *Context {
-	fixture.SetConfigManagementPlugin(plugin)
+	fixture.SetConfigManagementPlugins(plugin)
 	c.configManagementPlugin = plugin.Name
+	return c
+}
+
+func (c *Context) HelmRepoCredential(name, url string) *Context {
+	fixture.SetHelmRepoCredential(settings.HelmRepoCredentials{Name: name, URL: url})
 	return c
 }
 
@@ -86,5 +117,20 @@ func (c *Context) When() *Actions {
 
 func (c *Context) Prune(prune bool) *Context {
 	c.prune = prune
+	return c
+}
+
+func (c *Context) Async(async bool) *Context {
+	c.async = async
+	return c
+}
+
+func (c *Context) LocalPath(localPath string) *Context {
+	c.localPath = localPath
+	return c
+}
+
+func (c *Context) Project(project string) *Context {
+	c.project = project
 	return c
 }

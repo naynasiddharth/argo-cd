@@ -39,6 +39,12 @@ spec:
                   description: DryRun will perform a `kubectl apply --dry-run` without
                     actually performing the sync
                   type: boolean
+                manifests:
+                  description: Manifests is an optional field that overrides sync
+                    source with a local directory for development
+                  items:
+                    type: string
+                  type: array
                 prune:
                   description: Prune deletes resources that are no longer tracked
                     in git
@@ -690,7 +696,6 @@ spec:
                 - revision
                 - deployedAt
                 - id
-                - source
                 type: object
               type: array
             observedAt: {}
@@ -713,6 +718,12 @@ spec:
                           description: DryRun will perform a `kubectl apply --dry-run`
                             without actually performing the sync
                           type: boolean
+                        manifests:
+                          description: Manifests is an optional field that overrides
+                            sync source with a local directory for development
+                          items:
+                            type: string
+                          type: array
                         prune:
                           description: Prune deletes resources that are no longer
                             tracked in git
@@ -1165,7 +1176,6 @@ spec:
                       type: object
                   required:
                   - revision
-                  - source
                   type: object
               required:
               - operation
@@ -1411,8 +1421,6 @@ spec:
                   type: string
               required:
               - status
-              - comparedTo
-              - revision
               type: object
           type: object
       type: object
@@ -2114,14 +2122,21 @@ spec:
         - argocd
         image: argoproj/argocd:latest
         imagePullPolicy: Always
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8082
+          initialDelaySeconds: 5
+          periodSeconds: 10
         name: argocd-application-controller
         ports:
         - containerPort: 8082
         readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8082
           initialDelaySeconds: 5
           periodSeconds: 10
-          tcpSocket:
-            port: 8082
       serviceAccountName: argocd-application-controller
 ---
 apiVersion: apps/v1

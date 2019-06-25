@@ -11,14 +11,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/argoproj/pkg/errors"
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/ghodss/yaml"
 	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/argoproj/argo-cd/common"
 	. "github.com/argoproj/argo-cd/errors"
 	argocdclient "github.com/argoproj/argo-cd/pkg/apiclient"
 	sessionpkg "github.com/argoproj/argo-cd/pkg/apiclient/session"
@@ -140,15 +143,46 @@ func Settings(consumer func(s *settings.ArgoCDSettings)) {
 	CheckError(settingsManager.SaveSettings(s))
 }
 
+func updateSettingConfigMap(updater func(cm *corev1.ConfigMap) error) {
+	cm, err := KubeClientset.CoreV1().ConfigMaps(ArgoCDNamespace).Get(common.ArgoCDConfigMapName, v1.GetOptions{})
+	errors.CheckError(err)
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	errors.CheckError(updater(cm))
+	_, err = KubeClientset.CoreV1().ConfigMaps(ArgoCDNamespace).Update(cm)
+	errors.CheckError(err)
+}
+
 func SetResourceOverrides(overrides map[string]v1alpha1.ResourceOverride) {
-	Settings(func(s *settings.ArgoCDSettings) {
-		s.ResourceOverrides = overrides
+	updateSettingConfigMap(func(cm *corev1.ConfigMap) error {
+		if len(overrides) > 0 {
+			yamlBytes, err := yaml.Marshal(overrides)
+			if err != nil {
+				return err
+			}
+			cm.Data["resource.customizations"] = string(yamlBytes)
+		} else {
+			delete(cm.Data, "resource.customizations")
+		}
+		return nil
 	})
 }
 
-func SetConfigManagementPlugin(plugin v1alpha1.ConfigManagementPlugin) {
+func SetConfigManagementPlugins(plugin ...v1alpha1.ConfigManagementPlugin) {
+	updateSettingConfigMap(func(cm *corev1.ConfigMap) error {
+		yamlBytes, err := yaml.Marshal(plugin)
+		if err != nil {
+			return err
+		}
+		cm.Data["configManagementPlugins"] = string(yamlBytes)
+		return nil
+	})
+}
+
+func SetHelmRepoCredential(creds settings.HelmRepoCredentials) {
 	Settings(func(s *settings.ArgoCDSettings) {
-		s.ConfigManagementPlugins = []v1alpha1.ConfigManagementPlugin{plugin}
+		s.HelmRepositories = []settings.HelmRepoCredentials{creds}
 	})
 }
 
@@ -174,18 +208,22 @@ func EnsureCleanState(t *testing.T) {
 	CheckError(err)
 	CheckError(settingsManager.SaveSettings(&settings.ArgoCDSettings{
 		// changing theses causes a restart
-		AdminPasswordHash:    s.AdminPasswordHash,
-		AdminPasswordMtime:   s.AdminPasswordMtime,
-		ServerSignature:      s.ServerSignature,
-		Certificate:          s.Certificate,
-		DexConfig:            s.DexConfig,
-		OIDCConfigRAW:        s.OIDCConfigRAW,
-		URL:                  s.URL,
-		WebhookGitHubSecret:  s.WebhookGitHubSecret,
-		WebhookGitLabSecret:  s.WebhookGitLabSecret,
-		WebhookBitbucketUUID: s.WebhookBitbucketUUID,
-		Secrets:              s.Secrets,
+		AdminPasswordHash:            s.AdminPasswordHash,
+		AdminPasswordMtime:           s.AdminPasswordMtime,
+		ServerSignature:              s.ServerSignature,
+		Certificate:                  s.Certificate,
+		DexConfig:                    s.DexConfig,
+		OIDCConfigRAW:                s.OIDCConfigRAW,
+		URL:                          s.URL,
+		WebhookGitHubSecret:          s.WebhookGitHubSecret,
+		WebhookGitLabSecret:          s.WebhookGitLabSecret,
+		WebhookBitbucketUUID:         s.WebhookBitbucketUUID,
+		WebhookBitbucketServerSecret: s.WebhookBitbucketServerSecret,
+		WebhookGogsSecret:            s.WebhookGogsSecret,
+		Secrets:                      s.Secrets,
 	}))
+	SetResourceOverrides(make(map[string]v1alpha1.ResourceOverride))
+	SetConfigManagementPlugins()
 
 	// remove tmp dir
 	CheckError(os.RemoveAll(tmpDir))
@@ -275,4 +313,18 @@ func checkLocalRepo() {
 	if !strings.HasPrefix(repoUrl, "file://") {
 		log.WithFields(log.Fields{"repoUrl": repoUrl}).Fatal("cannot patch repo unless it is local")
 	}
+}
+
+// create the resource by creating using "kubctl apply", with bonus templating
+func Declarative(filename string, values interface{}) (string, error) {
+
+	bytes, err := ioutil.ReadFile("testdata/" + filename)
+	CheckError(err)
+
+	tmpFile, err := ioutil.TempFile("", "")
+	CheckError(err)
+	_, err = tmpFile.WriteString(Tmpl(string(bytes), values))
+	CheckError(err)
+
+	return Run("", "kubectl", "-n", ArgoCDNamespace, "apply", "-f", tmpFile.Name())
 }

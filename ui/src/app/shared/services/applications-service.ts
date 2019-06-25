@@ -1,3 +1,4 @@
+import * as deepMerge from 'deepmerge';
 import { Observable } from 'rxjs';
 
 import * as models from '../models';
@@ -28,6 +29,11 @@ export class ApplicationsService {
             query.refresh = refresh;
         }
         return requests.get(`/applications/${name}`).query(query).then((res) => this.parseAppFields(res.body));
+    }
+
+    public revisionMetadata(name: string, revision: string): Promise<models.RevisionMetadata> {
+        return requests.get(`/applications/${name}/revisions/${revision}/metadata`)
+            .then((res) => res.body as models.RevisionMetadata);
     }
 
     public resourceTree(name: string): Promise<models.ApplicationTree> {
@@ -167,16 +173,19 @@ export class ApplicationsService {
     }
 
     private parseAppFields(data: any): models.Application {
-        const app = data as models.Application;
-        app.kind = app.kind || 'Application';
-        if (app.spec) {
-            app.spec.project = app.spec.project || 'default';
-            delete app.spec.source.componentParameterOverrides;
-        }
-        if (app.status) {
-            app.status.resources = app.status.resources || [];
-            app.status.summary = app.status.summary || {};
-        }
-        return app;
+        data = deepMerge({
+            apiVersion: 'argoproj.io/v1alpha1',
+            kind: 'Application',
+            spec: {
+                project: 'default',
+            },
+            status: {
+                resources: [],
+                summary: {},
+            },
+        }, data);
+        delete data.spec.source.componentParameterOverrides;
+
+        return data as models.Application;
     }
 }

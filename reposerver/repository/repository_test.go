@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	argoappv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/cache"
@@ -28,12 +31,18 @@ func newMockRepoServerService(root string) *Service {
 	}
 }
 
-func newFakeGitClientFactory(root string) git.ClientFactory {
-	return &fakeGitClientFactory{root: root}
+func newFakeGitClientFactory(root string) *fakeGitClientFactory {
+	return &fakeGitClientFactory{
+		root:             root,
+		revision:         "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd",
+		revisionMetadata: &git.RevisionMetadata{Author: "foo", Message: strings.Repeat("x", 99), Tags: []string{"bar"}},
+	}
 }
 
 type fakeGitClientFactory struct {
-	root string
+	root             string
+	revision         string
+	revisionMetadata *git.RevisionMetadata
 }
 
 func (f *fakeGitClientFactory) NewClient(repoURL, path, username, password, sshPrivateKey string, insecureIgnoreHostKey bool) (git.Client, error) {
@@ -42,13 +51,14 @@ func (f *fakeGitClientFactory) NewClient(repoURL, path, username, password, sshP
 	if f.root != "" {
 		root = f.root
 	}
-	mockClient.On("Root", mock.Anything, mock.Anything).Return(root)
-	mockClient.On("Init", mock.Anything, mock.Anything).Return(nil)
-	mockClient.On("Fetch", mock.Anything, mock.Anything).Return(nil)
-	mockClient.On("Checkout", mock.Anything, mock.Anything).Return(nil)
-	mockClient.On("LsRemote", mock.Anything, mock.Anything).Return("aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd", nil)
-	mockClient.On("LsFiles", mock.Anything, mock.Anything).Return([]string{}, nil)
-	mockClient.On("CommitSHA", mock.Anything, mock.Anything).Return("aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd", nil)
+	mockClient.On("Root").Return(root)
+	mockClient.On("Init").Return(nil)
+	mockClient.On("Fetch", mock.Anything).Return(nil)
+	mockClient.On("Checkout", mock.Anything).Return(nil)
+	mockClient.On("LsRemote", mock.Anything).Return(f.revision, nil)
+	mockClient.On("LsFiles", mock.Anything).Return([]string{}, nil)
+	mockClient.On("CommitSHA", mock.Anything).Return(f.revision, nil)
+	mockClient.On("RevisionMetadata", f.revision).Return(f.revisionMetadata, nil)
 	return &mockClient, nil
 }
 
@@ -59,12 +69,12 @@ func TestGenerateYamlManifestInDir(t *testing.T) {
 	q := ManifestRequest{
 		ApplicationSource: &argoappv1.ApplicationSource{},
 	}
-	res1, err := GenerateManifests("../../manifests/base", &q)
+	res1, err := GenerateManifests("../../manifests", "base", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, countOfManifests, len(res1.Manifests))
 
 	// this will test concatenated manifests to verify we split YAMLs correctly
-	res2, err := GenerateManifests("./testdata/concatenated", &q)
+	res2, err := GenerateManifests("./testdata", "concatenated", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 3, len(res2.Manifests))
 }
@@ -74,9 +84,19 @@ func TestRecurseManifestsInDir(t *testing.T) {
 		ApplicationSource: &argoappv1.ApplicationSource{},
 	}
 	q.ApplicationSource.Directory = &argoappv1.ApplicationSourceDirectory{Recurse: true}
-	res1, err := GenerateManifests("./testdata/recurse", &q)
+	res1, err := GenerateManifests("./testdata", "recurse", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(res1.Manifests))
+}
+
+func TestNonExistentPath(t *testing.T) {
+	_, err := GenerateManifests("./testdata", "does-not-exist", nil)
+	assert.EqualError(t, err, "does-not-exist: app path does not exist")
+}
+
+func TestPathNotDir(t *testing.T) {
+	_, err := GenerateManifests("./testdata", "file.txt", nil)
+	assert.EqualError(t, err, "file.txt: app path is not a directory")
 }
 
 func TestGenerateJsonnetManifestInDir(t *testing.T) {
@@ -90,7 +110,7 @@ func TestGenerateJsonnetManifestInDir(t *testing.T) {
 			},
 		},
 	}
-	res1, err := GenerateManifests("./testdata/jsonnet", &q)
+	res1, err := GenerateManifests("./testdata", "jsonnet", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(res1.Manifests))
 }
@@ -109,7 +129,7 @@ func TestGenerateHelmChartWithDependencies(t *testing.T) {
 	q := ManifestRequest{
 		ApplicationSource: &argoappv1.ApplicationSource{},
 	}
-	res1, err := GenerateManifests("../../util/helm/testdata/wordpress", &q)
+	res1, err := GenerateManifests("../../util/helm/testdata", "wordpress", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 12, len(res1.Manifests))
 }
@@ -118,17 +138,17 @@ func TestGenerateNullList(t *testing.T) {
 	q := ManifestRequest{
 		ApplicationSource: &argoappv1.ApplicationSource{},
 	}
-	res1, err := GenerateManifests("./testdata/null-list", &q)
+	res1, err := GenerateManifests("./testdata", "null-list", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, len(res1.Manifests), 1)
 	assert.Contains(t, res1.Manifests[0], "prometheus-operator-operator")
 
-	res1, err = GenerateManifests("./testdata/empty-list", &q)
+	res1, err = GenerateManifests("./testdata", "empty-list", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, len(res1.Manifests), 1)
 	assert.Contains(t, res1.Manifests[0], "prometheus-operator-operator")
 
-	res2, err := GenerateManifests("./testdata/weird-list", &q)
+	res2, err := GenerateManifests("./testdata", "weird-list", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(res2.Manifests))
 }
@@ -148,7 +168,7 @@ func TestIdentifyAppSourceTypeByAppDirWithKustomizations(t *testing.T) {
 }
 
 func TestRunCustomTool(t *testing.T) {
-	res, err := GenerateManifests(".", &ManifestRequest{
+	res, err := GenerateManifests(".", ".", &ManifestRequest{
 		AppLabelValue: "test-app",
 		Namespace:     "test-namespace",
 		ApplicationSource: &argoappv1.ApplicationSource{
@@ -185,7 +205,7 @@ func TestGenerateFromUTF16(t *testing.T) {
 	q := ManifestRequest{
 		ApplicationSource: &argoappv1.ApplicationSource{},
 	}
-	res1, err := GenerateManifests("./testdata/utf-16", &q)
+	res1, err := GenerateManifests("./testdata", "utf-16", &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(res1.Manifests))
 }
@@ -259,4 +279,43 @@ func TestGetAppDetailsKustomize(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, res.Kustomize.Images)
 	assert.Equal(t, []*argoappv1.KustomizeImageTag{{Name: "nginx", Value: "1.15.4"}, {Name: "k8s.gcr.io/nginx-slim", Value: "0.8"}}, res.Kustomize.ImageTags)
+}
+
+func TestService_GetRevisionMetadata(t *testing.T) {
+	factory := newFakeGitClientFactory(".")
+	service := &Service{
+		repoLock:   util.NewKeyLock(),
+		gitFactory: factory,
+		cache:      cache.NewCache(cache.NewInMemoryCache(1 * time.Hour)),
+	}
+	type args struct {
+		q *RepoServerRevisionMetadataRequest
+	}
+	q := &RepoServerRevisionMetadataRequest{Repo: &argoappv1.Repository{}, Revision: factory.revision}
+	metadata := &v1alpha1.RevisionMetadata{
+		Author:  factory.revisionMetadata.Author,
+		Message: strings.Repeat("x", 61) + "...",
+		Tags:    factory.revisionMetadata.Tags,
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    *v1alpha1.RevisionMetadata
+		wantErr bool
+	}{
+		{"CacheMiss", args{q: q}, metadata, false},
+		{"CacheHit", args{q: q}, metadata, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := service.GetRevisionMetadata(context.Background(), tt.args.q)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Service.GetRevisionMetadata() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Service.GetRevisionMetadata() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

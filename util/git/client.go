@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
@@ -17,6 +19,13 @@ import (
 	"gopkg.in/src-d/go-git.v4/storage/memory"
 )
 
+type RevisionMetadata struct {
+	Author  string
+	Date    time.Time
+	Tags    []string
+	Message string
+}
+
 // Client is a generic git client interface
 type Client interface {
 	Root() string
@@ -26,6 +35,7 @@ type Client interface {
 	LsRemote(revision string) (string, error)
 	LsFiles(path string) ([]string, error)
 	CommitSHA() (string, error)
+	RevisionMetadata(revision string) (*RevisionMetadata, error)
 }
 
 // ClientFactory is a factory of Git Clients
@@ -38,7 +48,7 @@ type ClientFactory interface {
 type nativeGitClient struct {
 	repoURL string
 	root    string
-	auth    transport.AuthMethod
+	creds   Creds
 }
 
 type factory struct{}
@@ -48,30 +58,43 @@ func NewFactory() ClientFactory {
 }
 
 func (f *factory) NewClient(rawRepoURL, path, username, password, sshPrivateKey string, insecureIgnoreHostKey bool) (Client, error) {
-	var sshUser string
-	if isSSH, user := IsSSHURL(rawRepoURL); isSSH {
-		sshUser = user
+	var creds Creds
+	if sshPrivateKey != "" {
+		creds = SSHCreds{sshPrivateKey, insecureIgnoreHostKey}
+	} else if username != "" || password != "" {
+		creds = HTTPSCreds{username, password}
+	} else {
+		creds = NopCreds{}
 	}
-
-	clnt := nativeGitClient{
+	client := nativeGitClient{
 		repoURL: rawRepoURL,
 		root:    path,
+		creds:   creds,
 	}
-	if sshPrivateKey != "" {
-		signer, err := ssh.ParsePrivateKey([]byte(sshPrivateKey))
+	return &client, nil
+}
+
+func newAuth(repoURL string, creds Creds) (transport.AuthMethod, error) {
+	switch creds := creds.(type) {
+	case SSHCreds:
+		var sshUser string
+		if isSSH, user := IsSSHURL(repoURL); isSSH {
+			sshUser = user
+		}
+		signer, err := ssh.ParsePrivateKey([]byte(creds.sshPrivateKey))
 		if err != nil {
 			return nil, err
 		}
 		auth := &ssh2.PublicKeys{User: sshUser, Signer: signer}
-		if insecureIgnoreHostKey {
+		if creds.insecureIgnoreHostKey {
 			auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		}
-		clnt.auth = auth
-	} else if username != "" || password != "" {
-		auth := &http.BasicAuth{Username: username, Password: password}
-		clnt.auth = auth
+		return auth, nil
+	case HTTPSCreds:
+		auth := http.BasicAuth{Username: creds.username, Password: creds.password}
+		return &auth, nil
 	}
-	return &clnt, nil
+	return nil, nil
 }
 
 func (m *nativeGitClient) Root() string {
@@ -109,34 +132,7 @@ func (m *nativeGitClient) Init() error {
 
 // Fetch fetches latest updates from origin
 func (m *nativeGitClient) Fetch() error {
-	log.Debugf("Fetching repo %s at %s", m.repoURL, m.root)
-	// Two techniques are used for fetching the remote depending if the remote is SSH vs. HTTPS
-	// If http, we fork/exec the git CLI since the go-git client does not properly support git
-	// providers such as AWS CodeCommit and Azure DevOps.
-	if _, ok := m.auth.(*ssh2.PublicKeys); ok {
-		return m.goGitFetch()
-	}
 	_, err := m.runCredentialedCmd("git", "fetch", "origin", "--tags", "--force")
-	return err
-}
-
-// goGitFetch fetches the remote using go-git
-func (m *nativeGitClient) goGitFetch() error {
-	repo, err := git.PlainOpen(m.root)
-	if err != nil {
-		return err
-	}
-
-	log.Debug("git fetch origin --tags --force")
-	err = repo.Fetch(&git.FetchOptions{
-		RemoteName: git.DefaultRemoteName,
-		Auth:       m.auth,
-		Tags:       git.AllTags,
-		Force:      true,
-	})
-	if err == git.NoErrAlreadyUpToDate {
-		return nil
-	}
 	return err
 }
 
@@ -185,7 +181,11 @@ func (m *nativeGitClient) LsRemote(revision string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	refs, err := remote.List(&git.ListOptions{Auth: m.auth})
+	auth, err := newAuth(m.repoURL, m.creds)
+	if err != nil {
+		return "", err
+	}
+	refs, err := remote.List(&git.ListOptions{Auth: auth})
 	if err != nil {
 		return "", err
 	}
@@ -246,6 +246,29 @@ func (m *nativeGitClient) CommitSHA() (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// returns the meta-data for the commit
+func (m *nativeGitClient) RevisionMetadata(revision string) (*RevisionMetadata, error) {
+	out, err := m.runCmd("git", "show", "-s", "--format=%an <%ae>|%at|%B", revision)
+	if err != nil {
+		return nil, err
+	}
+	segments := strings.SplitN(out, "|", 3)
+	if len(segments) != 3 {
+		return nil, fmt.Errorf("expected 3 segments, got %v", segments)
+	}
+	author := segments[0]
+	authorDateUnixTimestamp, _ := strconv.ParseInt(segments[1], 10, 64)
+	message := strings.TrimSpace(segments[2])
+
+	out, err = m.runCmd("git", "tag", "--points-at", revision)
+	if err != nil {
+		return nil, err
+	}
+	tags := strings.Fields(out)
+
+	return &RevisionMetadata{author, time.Unix(authorDateUnixTimestamp, 0), tags, message}, nil
+}
+
 // runCmd is a convenience function to run a command in a given directory and return its output
 func (m *nativeGitClient) runCmd(command string, args ...string) (string, error) {
 	cmd := exec.Command(command, args...)
@@ -255,11 +278,12 @@ func (m *nativeGitClient) runCmd(command string, args ...string) (string, error)
 // runCredentialedCmd is a convenience function to run a git command with username/password credentials
 func (m *nativeGitClient) runCredentialedCmd(command string, args ...string) (string, error) {
 	cmd := exec.Command(command, args...)
-	if auth, ok := m.auth.(*http.BasicAuth); ok {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_ASKPASS=git-ask-pass.sh"))
-		cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_USERNAME=%s", auth.Username))
-		cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_PASSWORD=%s", auth.Password))
+	closer, environ, err := m.creds.Environ()
+	if err != nil {
+		return "", err
 	}
+	defer func() { _ = closer.Close() }()
+	cmd.Env = append(cmd.Env, environ...)
 	return m.runCmdOutput(cmd)
 }
 

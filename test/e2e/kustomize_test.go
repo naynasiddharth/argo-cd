@@ -49,6 +49,10 @@ func TestKustomize2AppSource(t *testing.T) {
 		When().
 		Sync().
 		Then().
+		Expect(Success("")).
+		Expect(OperationPhaseIs(OperationSucceeded)).
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(HealthIs(HealthStatusHealthy)).
 		And(patchLabelMatchesFor("Service")).
 		And(patchLabelMatchesFor("Deployment"))
 }
@@ -104,4 +108,31 @@ func TestSyncStatusOptionIgnore(t *testing.T) {
 				assert.Equal(t, SyncStatusCodeOutOfSync, resourceStatus.Status)
 			}
 		})
+}
+
+// make sure we can create an app which has a SSH remote base
+func TestKustomizeSSHRemoteBase(t *testing.T) {
+	Given(t).
+		// not the best test, as we should have two remote repos both with the same SSH private key
+		SSHRepo().
+		Path("remote-base").
+		When().
+		Create().
+		Sync().
+		Then().
+		Expect(OperationPhaseIs(OperationSucceeded)).
+		Expect(ResourceSyncStatusIs("ConfigMap", "my-map", SyncStatusCodeSynced))
+}
+
+// make sure we can create an app which has a SSH remote base
+func TestKustomizeDeclarativeInvalidApp(t *testing.T) {
+	Given(t).
+		Path("invalid-kustomize").
+		When().
+		Declarative("declarative-apps/app.yaml").
+		Then().
+		Expect(Success("")).
+		Expect(HealthIs(HealthStatusHealthy)).
+		Expect(SyncStatusIs(SyncStatusCodeUnknown)).
+		Expect(Condition(ApplicationConditionComparisonError, "invalid-kustomize/does-not-exist.yaml: no such file or directory"))
 }
