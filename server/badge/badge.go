@@ -8,7 +8,7 @@ import (
 	"github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-  "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
+	"github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
 )
 
 //NewHandler creates handler serving to do api/badge endpoint
