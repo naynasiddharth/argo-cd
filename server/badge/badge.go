@@ -22,29 +22,55 @@ type Handler struct {
 	appClientset versioned.Interface
 }
 
+type badgeColor = string
+
+const (
+	//badge color is light blue
+	parameterNotGiven badgeColor = "fill:rgb(200,321,233);stroke:black"
+	//badge color is mustard
+	keyNotFound badgeColor = "fill:rgb(255,43,0);stroke:black"
+	//light green
+	healthyBadge badgeColor = "fill:rgb(127,255,131);stroke:black"
+	//light yellow
+	progressingBadge badgeColor = "fill:rgb(255,251,92);stroke:black"
+	//orange
+	suspendedBadge badgeColor = "fill:rgb(255,145,0);stroke:black"
+	//teal
+	degradedBadge badgeColor = "fill:rgb(109,202,205);stroke:black"
+	//red
+	missingBadge badgeColor = "fill:rgb(255,36,36);stroke:black"
+	//purple
+	unknownHealthBadge badgeColor = "fill:rgb(178,102,255);stroke:black"
+	//darker green
+	syncedBadge badgeColor = "fill:rgb(0,204,0);stroke:black"
+	//red
+	outOfSyncBadge badgeColor = "fill:rgb(255,57,57);stroke:black"
+	//darker purple
+	unknownSyncBadge badgeColor = "fill:rgb(209,155,177);stroke:black"
+	pageWidth                   = 2000
+	pageHeight                  = 2000
+	xStart                      = 0
+	yStart                      = 0
+	badgeHeight                 = 25
+	//badgeCurve is the rx/ry value for the round rectangle for each badge
+	badgeCurve = 2
+	textFormat = "font-size:11;fill:black"
+	yText      = 17
+	//xHealthText is x pos where text for health badge and edge case badges start
+	xHealthText       = 3
+	nameMissingLength = 120
+)
+
 //ServeHTTP returns badge with health and sync status for application
 //(or an error badge if wrong query or application name is given)
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//Sample url: http://localhost:8080/api/badge?name=123
 	keys, ok := r.URL.Query()["name"]
 
-	pageWidth := 2000
-	pageHeight := 2000
-	xStart := 0
-	yStart := 0
-	badgeHeight := 25
-	//badgeCurve is the rx/ry value for the round rectangle for each badge
-	badgeCurve := 2
-	textFormat := "font-size:11;fill:black"
-	yText := 17
-	//xHealthText is x pos where text for health badge and edge case badges start
-	xHealthText := 3
-	nameMissingLength := 120
-
 	if !ok || len(keys[0]) < 1 {
 		svgOne := svg.New(w)
 		svgOne.Start(pageWidth, pageHeight)
-		svgOne.Roundrect(xStart, yStart, nameMissingLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(200,321,233);stroke:black")
+		svgOne.Roundrect(xStart, yStart, nameMissingLength, badgeHeight, badgeCurve, badgeCurve, parameterNotGiven)
 		svgOne.Text(xHealthText, yText, "Param 'name=' missing", textFormat)
 		svgOne.End()
 		return
@@ -60,7 +86,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		notFoundBadgeLength := len("Application"+key+" not found") * 6
 		svgTwo := svg.New(w)
 		svgTwo.Start(pageWidth, pageHeight)
-		svgTwo.Roundrect(xStart, yStart, notFoundBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,43,0);stroke:black")
+		svgTwo.Roundrect(xStart, yStart, notFoundBadgeLength, badgeHeight, badgeCurve, badgeCurve, keyNotFound)
 		svgTwo.Text(xHealthText, yText, "Application '"+key+"' not found", textFormat)
 		svgTwo.End()
 		return
@@ -77,33 +103,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch health {
 	case appv1.HealthStatusHealthy:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(127,255,131);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, healthyBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	case appv1.HealthStatusProgressing:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,251,92);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, progressingBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	case appv1.HealthStatusSuspended:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,145,0);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, suspendedBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	case appv1.HealthStatusDegraded:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(109,202,205);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, degradedBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	case appv1.HealthStatusMissing:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,36,36);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, missingBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	default:
-		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(178,102,255);stroke:black")
+		svgThree.Roundrect(xStart, yStart, healthBadgeLength, badgeHeight, badgeCurve, badgeCurve, unknownHealthBadge)
 		svgThree.Text(xHealthText, yText, health, textFormat)
 	}
 	switch status {
 	case appv1.SyncStatusCodeSynced:
-		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(0,204,0);stroke:black")
+		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, syncedBadge)
 		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	case appv1.SyncStatusCodeOutOfSync:
-		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,57,57);stroke:black")
+		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, outOfSyncBadge)
 		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	default:
-		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(209,155,177);stroke:black")
+		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, unknownSyncBadge)
 		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	}
 
