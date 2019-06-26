@@ -7,6 +7,7 @@ import (
 	svg "github.com/ajstarks/svgo"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
 )
 
@@ -27,8 +28,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//Sample url: http://localhost:8080/api/badge?name=123
 	keys, ok := r.URL.Query()["name"]
 
-	//error when you add another query after name = and do like http://localhost:8080/api/badge?name=123/hadfkjajdhj
-
 	pageWidth := 2000
 	pageHeight := 2000
 	xStart := 0
@@ -36,17 +35,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	badgeHeight := 25
 	//badgeCurve is the rx/ry value for the round rectangle for each badge
 	badgeCurve := 2
-	//xHealthText is x pos where text for health badge and edge case badges start
-	xHealthText := 3
-
 	textFormat := "font-size:11;fill:black"
 	yText := 17
+	//xHealthText is x pos where text for health badge and edge case badges start
+	xHealthText := 3
+	nameMissingLength := 120
 
 	if !ok || len(keys[0]) < 1 {
 		svgOne := svg.New(w)
 		svgOne.Start(pageWidth, pageHeight)
-		svgOne.Roundrect(xStart, yStart, 164, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(200,321,233);stroke:black")
-		svgOne.Text(xHealthText, yText, "Param 'name=' missing or left blank", textFormat)
+		svgOne.Roundrect(xStart, yStart, nameMissingLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(200,321,233);stroke:black")
+		svgOne.Text(xHealthText, yText, "Param 'name=' missing", textFormat)
 		svgOne.End()
 		return
 	}
@@ -61,7 +60,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		notFoundBadgeLength := len("Application"+key+" not found") * 6
 		svgTwo := svg.New(w)
 		svgTwo.Start(pageWidth, pageHeight)
-		svgTwo.Roundrect(xStart, yStart, notFoundBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(252, 197, 0);stroke:black")
+		svgTwo.Roundrect(xStart, yStart, notFoundBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,43,0);stroke:black")
 		svgTwo.Text(xHealthText, yText, "Application '"+key+"' not found", textFormat)
 		svgTwo.End()
 		return
@@ -69,8 +68,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	health := app.Status.Health.Status
 	status := app.Status.Sync.Status
-	//healthBadgeLength is where the x value sync badge starts along with being the length of the health badge
 	healthBadgeLength := len(health) * 7
+	//healthBadgeLength is where the sync badge starts along with being the length of the health badge
 	syncBadgeLength := len(status) * 7
 	syncTextStart := healthBadgeLength + 3
 	svgThree := svg.New(w)
@@ -99,13 +98,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch status {
 	case appv1.SyncStatusCodeSynced:
 		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(0,204,0);stroke:black")
-		svgThree.Text(syncTextStart, yText, string(appv1.SyncStatusCodeSynced), textFormat)
+		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	case appv1.SyncStatusCodeOutOfSync:
 		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(255,57,57);stroke:black")
-		svgThree.Text(syncTextStart, yText, string(appv1.SyncStatusCodeOutOfSync), textFormat)
+		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	default:
 		svgThree.Roundrect(healthBadgeLength, yStart, syncBadgeLength, badgeHeight, badgeCurve, badgeCurve, "fill:rgb(209,155,177);stroke:black")
-		svgThree.Text(syncTextStart, yText, string(appv1.SyncStatusCodeUnknown), textFormat)
+		svgThree.Text(syncTextStart, yText, string(status), textFormat)
 	}
+
 	svgThree.End()
 }
